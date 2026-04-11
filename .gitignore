@@ -1,0 +1,8 @@
+# Ignore mscoco dataset 
+/dataset
+
+# model file 
+/models
+
+# ignore __pycache__ anywhere in the project
+__pycache__/
