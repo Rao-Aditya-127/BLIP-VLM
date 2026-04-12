@@ -87,6 +87,14 @@ class Blip2QFormerTrainer(nn.Module):
             weights_t2i = F.softmax(sim_t2i_neg, dim=1)  # [B, B]
             weights_i2t = F.softmax(sim_i2t_neg, dim=1)  # [B, B]
 
+            # Guard against nan/inf that can appear at initialization when
+            # F.normalize produces nan for near-zero projection outputs.
+            # Rows that are all-zero after cleanup fall back to uniform sampling.
+            weights_t2i = torch.nan_to_num(weights_t2i, nan=0.0).clamp(min=0)
+            weights_i2t = torch.nan_to_num(weights_i2t, nan=0.0).clamp(min=0)
+            weights_t2i += (weights_t2i.sum(-1, keepdim=True) == 0).float()
+            weights_i2t += (weights_i2t.sum(-1, keepdim=True) == 0).float()
+
         # For each text, select a hard negative image
         neg_image_indices = torch.multinomial(weights_t2i, 1).squeeze(1)  # [B]
         image_embeds_neg = image_embeds[neg_image_indices]  # [B, P, H_v]

@@ -67,9 +67,11 @@ def create_attention_mask(
     mask = mask & presence_mask
 
     # Convert boolean mask to additive mask (DistilBERT uses scores + mask internally).
-    # False positions must become -inf so softmax zeroes them out; True stays 0.0.
+    # Use a large finite value instead of -inf: softmax([-inf,...,-inf]) = NaN (0/0),
+    # while softmax([-1e4,...,-1e4]) = uniform small weights, which is numerically safe.
+    # Padded positions still get ~0 attention weight in practice.
     additive = torch.zeros(B, T + I, T + I, device=device, dtype=torch.float)
-    additive = additive.masked_fill(~mask, float("-inf"))
+    additive = additive.masked_fill(~mask, -1e4)
     return additive.unsqueeze(1)  # [B, 1, T+I, T+I]
 
 
@@ -224,13 +226,13 @@ class QFormer(nn.Module):
             text_attention_mask = text_attention_mask.to(torch.bool)
 
         # Text-only self-attention mask: [B, 1, T, T] with padding handled.
-        # Convert to additive convention (0.0 = attend, -inf = block).
+        # Use -1e4 instead of -inf to avoid softmax([-inf,...,-inf]) = NaN for fully-padded rows.
         bool_mask = (
             text_attention_mask.unsqueeze(1).unsqueeze(2)
             & text_attention_mask.unsqueeze(1).unsqueeze(3)
         )  # [B, 1, T, T]
         attn_mask = torch.zeros(B, 1, T, T, device=text_input_ids.device, dtype=torch.float)
-        attn_mask = attn_mask.masked_fill(~bool_mask, float("-inf"))
+        attn_mask = attn_mask.masked_fill(~bool_mask, -1e4)
 
         x = txt_emb
         for i, layer in enumerate(self.encoder_layers):
