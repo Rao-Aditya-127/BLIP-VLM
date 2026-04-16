@@ -6,3 +6,6 @@
 
 # ignore __pycache__ anywhere in the project
 __pycache__/
+
+#trained model file
+/models_trained 

@@ -1,15 +1,12 @@
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from functools import partial
 import pyarrow.parquet as pq
-import os
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader, random_split
 import torch
 from torch.nn.utils.rnn import pad_sequence
-from transformers import ViTModel, ViTImageProcessor, AutoTokenizer
-import numpy as np
+from transformers import ViTImageProcessor, AutoTokenizer
 import random
 
 device = (
@@ -20,17 +17,17 @@ device = (
 
 
 @dataclass(frozen=True)
-class CCExample:
+class MSCOCOExample:
     image_path: Path
     caption: str
 
 
 class LMDataset(Dataset):
     """
-    Torch-style Dataset for Conceptual Captions images downloaded via img2dataset.
+    Torch-style Dataset for MS COCO images for LLM training.
 
-    Returns by default: (PIL.Image, caption)
-    Set `return_image_path=True` to return (Path, caption) instead.
+    Returns pixel_values [3, 224, 224] + tokenized prefix/assistant prompts.
+    ViT inference is excluded — the model runs it batched on GPU in forward().
     """
 
     def __init__(
@@ -38,18 +35,14 @@ class LMDataset(Dataset):
         dataset_root: str | Path = "dataset",
         vit_model: str = "google/vit-base-patch16-224",
         tokenizer: Optional[str] = None,
-        return_image_path: bool = False,
     ) -> None:
-        self.images_root = Path(dataset_root, "cc_images")
-        self.index_parquet = Path(dataset_root, "conceptual-captions-200k.parquet")
-
+        self.images_root = Path(dataset_root, "mscoco_images")
+        # Processor is CPU-only: safe to use inside DataLoader workers
         self.vit_processor = ViTImageProcessor.from_pretrained(vit_model)
-        self.vit_model = ViTModel.from_pretrained(vit_model)
-        self.vit_model.to(device)
+
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer)
 
-        self.return_image_path = return_image_path
-        self._examples: list[CCExample] = self._build_index()
+        self._examples: list[MSCOCOExample] = self._build_index()
 
         self.prompts = [
             "Tell me about this image:",
@@ -66,49 +59,29 @@ class LMDataset(Dataset):
             "What's happening in this photo?",
         ]
 
-    def _build_image_paths(self):
-        # Loop recursively 2 directories down and find all jpg files
-        jpg_files = {}
-        for subdir1 in self.images_root.iterdir():
-            if not subdir1.is_dir():
+    def _build_index(self) -> list[MSCOCOExample]:
+        out: list[MSCOCOExample] = []
+        for parquet_file in sorted(self.images_root.glob("*.parquet")):
+            shard_name = parquet_file.stem  # e.g. "00000"
+            shard_dir = self.images_root / shard_name
+            if not shard_dir.is_dir():
                 continue
-            for file in subdir1.iterdir():
-                if file.is_file() and file.suffix.lower() == ".jpg":
-                    if file.name.startswith("."):
-                        continue
-                    file_idx = int(file.name.split(".")[0])
-                    jpg_files[file_idx] = os.path.join(
-                        self.images_root, subdir1.name, file.name
-                    )
-        return jpg_files
-
-    def _load_caption_index(self) -> Dict[str, str]:
-        table = pq.read_table(self.index_parquet, columns=["url", "caption"])
-        urls = table["url"].to_pylist()
-        caps = table["caption"].to_pylist()
-
-        url_to_caption: Dict[str, str] = {}
-        for u, c in zip(urls, caps):
-            if u is None:
-                continue
-            if c is None:
-                continue
-            url_to_caption[str(u)] = str(c)
-        return url_to_caption
-
-    def _build_index(self) -> list[CCExample]:
-        image_files = self._build_image_paths()
-        url_to_caption = self._load_caption_index()
-
-        table = pq.read_table(self.index_parquet, columns=["url", "caption"])
-        captions = table["caption"].to_pylist()
-        out: list[CCExample] = []
-        for idx, caption in enumerate(captions):
-            if idx in image_files:
+            table = pq.read_table(parquet_file, columns=["key", "caption", "status"])
+            keys = table["key"].to_pylist()
+            captions = table["caption"].to_pylist()
+            statuses = table["status"].to_pylist()
+            for key, caption, status in zip(keys, captions, statuses):
+                if status != "success":
+                    continue
+                if not caption:
+                    continue
+                jpg_file = shard_dir / f"{key}.jpg"
+                if not jpg_file.exists():
+                    continue
                 out.append(
-                    CCExample(
-                        image_path=image_files[idx],
-                        caption=caption,
+                    MSCOCOExample(
+                        image_path=jpg_file,
+                        caption=str(caption).strip(),
                     )
                 )
         return out
@@ -116,38 +89,39 @@ class LMDataset(Dataset):
     def __len__(self) -> int:
         return len(self._examples)
 
-    def __getitem__(self, idx: int) -> Tuple[Any, Any] | Dict[str, Any]:
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
         ex = self._examples[idx]
-        caption: Any = ex.caption
 
         with Image.open(ex.image_path) as im:
             image = im.convert("RGB").copy()
 
-        with torch.no_grad():
-            image = self.vit_processor(images=image, return_tensors="pt").to(
-                self.vit_model.device
-            )
-            image = self.vit_model(**image).last_hidden_state
-        # [1, num_patches, hidden_dim] -> [num_patches, hidden_dim]
-        image = image.squeeze(0)
+        # CPU-only preprocessing — no GPU, safe in DataLoader workers
+        pixel_values = self.vit_processor(images=image, return_tensors="pt").pixel_values
+        pixel_values = pixel_values.squeeze(0)  # [3, 224, 224]
 
         random_prompt = random.choice(self.prompts)
-        user_prompt = self.tokenizer.apply_chat_template(
+        user_text = self.tokenizer.apply_chat_template(
             [
                 {"role": "system", "content": "Answer the user's question truthfully"},
                 {"role": "user", "content": random_prompt},
             ],
-            return_tensors="pt",
-        ).to(device)
-
-        assistant_prompt = self.tokenizer.apply_chat_template(
-            [{"role": "assistant", "content": caption}],
-            return_tensors="pt",
+            tokenize=False,
             add_generation_prompt=False,
         )
+        user_prompt = torch.tensor(
+            [self.tokenizer.encode(user_text)]
+        ).to(device)  # [1, seq_len]
 
-        # Ensure sequence ends with EOS token (trim any trailing tokens like newlines)
-        # Find the last occurrence of EOS token and truncate after it
+        assistant_text = self.tokenizer.apply_chat_template(
+            [{"role": "assistant", "content": ex.caption}],
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+        assistant_prompt = torch.tensor(
+            [self.tokenizer.encode(assistant_text)]
+        )  # [1, seq_len]
+
+        # Trim any tokens after the last EOS
         eos_positions = (assistant_prompt[0] == self.tokenizer.eos_token_id).nonzero(
             as_tuple=True
         )[0]
@@ -158,9 +132,9 @@ class LMDataset(Dataset):
         assistant_prompt = assistant_prompt.to(device)
 
         return {
-            "image_filename": ex.image_path,
-            "caption": caption,
-            "image": image,
+            "image_filename": str(ex.image_path),
+            "caption": ex.caption,
+            "image": pixel_values,
             "prefix": user_prompt,
             "assistant_prompt": assistant_prompt,
         }
@@ -187,9 +161,8 @@ class LMCollator:
             for item in batch
         ]
 
-        images = torch.stack(images)
+        images = torch.stack(images)  # [B, 3, 224, 224]
 
-        # Determine padding value
         pad_id = self.tokenizer.pad_token_id
         if pad_id is None:
             pad_id = self.tokenizer.eos_token_id
@@ -198,7 +171,7 @@ class LMCollator:
                     "Tokenizer must have a pad_token_id or eos_token_id set."
                 )
 
-        # Left Pad Prefixes manually
+        # Left-pad prefixes
         max_prefix_len = max([p.size(0) for p in prefixes])
         prefixes_padded = torch.full(
             (len(prefixes), max_prefix_len), pad_id, dtype=torch.long
@@ -206,7 +179,7 @@ class LMCollator:
         for i, p in enumerate(prefixes):
             prefixes_padded[i, -len(p) :] = p
 
-        # Pad sequences (right padding) for assistant prompts
+        # Right-pad assistant prompts
         assistant_prompts_padded = pad_sequence(
             assistant_prompts, batch_first=True, padding_value=pad_id
         )
@@ -218,32 +191,17 @@ class LMCollator:
         }
 
 
-def get_dataset(split_ratio=0.9, seed=42, tokenizer_name="Qwen/Qwen3-0.6B"):
-
-    dataset = LMDataset(tokenizer=tokenizer_name)
-    # Ensure pad_token is set for Qwen if using it directly, though Collator handles fallback to EOS
-    if dataset.tokenizer.pad_token is None:
-        dataset.tokenizer.pad_token = dataset.tokenizer.eos_token
-
-    # Split dataset into train and test
-    train_size = int(split_ratio * len(dataset))
-    test_size = len(dataset) - train_size
-    train_dataset, test_dataset = random_split(
-        dataset, [train_size, test_size], generator=torch.Generator().manual_seed(seed)
-    )
-    return train_dataset.dataset, test_dataset.dataset
-
-
 def get_dataloader(
-    batch_size=4, split_ratio=0.9, seed=42, tokenizer_name="Qwen/Qwen3-0.6B"
+    batch_size=4,
+    split_ratio=0.9,
+    seed=42,
+    tokenizer_name="HuggingFaceTB/SmolLM-135M-Instruct",
 ):
-
     dataset = LMDataset(tokenizer=tokenizer_name)
-    # Ensure pad_token is set for Qwen if using it directly, though Collator handles fallback to EOS
+
     if dataset.tokenizer.pad_token is None:
         dataset.tokenizer.pad_token = dataset.tokenizer.eos_token
 
-    # Split dataset into train and test
     train_size = int(split_ratio * len(dataset))
     test_size = len(dataset) - train_size
     train_dataset, test_dataset = random_split(
@@ -255,7 +213,6 @@ def get_dataloader(
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collator
     )
-
     test_loader = DataLoader(
         test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collator
     )
@@ -264,16 +221,12 @@ def get_dataloader(
 
 
 if __name__ == "__main__":
-
-    train_loader, test_loader = get_dataloader()
+    train_loader, test_loader = get_dataloader(batch_size=4)
     print(f"Train loader batches: {len(train_loader)}")
     print(f"Test loader batches: {len(test_loader)}")
 
     for d in train_loader:
-        print("Image shape:", d["image"].shape)
-        print("Prefix shape:", d["prefix"].shape)
+        print("Image shape:          ", d["image"].shape)           # [4, 3, 224, 224]
+        print("Prefix shape:         ", d["prefix"].shape)
         print("Assistant prompt shape:", d["assistant_prompt"].shape)
-        print(d["prefix"])
-        print(d["assistant_prompt"])
-
         break
