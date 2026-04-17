@@ -9,3 +9,9 @@ __pycache__/
 
 #trained model file
 /models_trained 
+
+#ignore trained model file for vlm  
+/models_trained_vlm
+
+#ignore test images for vlm evaluation
+/images_test
