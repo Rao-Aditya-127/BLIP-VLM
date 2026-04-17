@@ -52,7 +52,7 @@ class LM_2_VLM(nn.Module):
             ],
         )
 
-        self.llm = get_peft_model(self.llm, peft_config)
+        self.llm = get_peft_model(self.llm, peft_config, autocast_adapter_dtype=False)
         self.llm.print_trainable_parameters()
 
         # --- Adapter: QFormer hidden dim → LLM hidden dim ---
@@ -74,7 +74,10 @@ class LM_2_VLM(nn.Module):
         """Run frozen ViT on pixel_values, return QFormer query embeddings."""
         with torch.no_grad():
             vit_out = self.vit(pixel_values=pixel_values.to(dtype=self.vit.dtype))
-            visual_feats = vit_out.last_hidden_state  # [B, 197, 768]
+            # Cast to QFormer dtype (float32) — ViT runs bfloat16, QFormer is float32
+            visual_feats = vit_out.last_hidden_state.to(
+                dtype=next(self.qformer.parameters()).dtype
+            )  # [B, 197, 768]
         img_emb, _ = self.qformer.encode_image(visual_feats)  # [B, Q, H_q]
         img_emb = self.adapter(img_emb)                        # [B, Q, H_llm]
         return img_emb.to(dtype=self.llm.dtype)
@@ -177,13 +180,17 @@ class LM_2_VLM(nn.Module):
         img_emb = self._encode_images(img)  # [B, Q, H_llm]
 
         prefix_emb = self.llm.get_input_embeddings()(prefix_ids)
-        assistant_part = self.tokenizer.apply_chat_template(
+
+        # tokenize=False + encode() avoids fast-tokenizer returning Encoding objects
+        assistant_text = self.tokenizer.apply_chat_template(
             [{"role": "assistant", "content": ""}],
+            tokenize=False,
             add_generation_prompt=False,
         )
+        assistant_ids = self.tokenizer.encode(assistant_text)[:-2]  # strip trailing tokens
         assistant_part = torch.tensor(
-            assistant_part[:-2], device=prefix_emb.device
-        ).repeat(prefix_emb.shape[0], 1)
+            assistant_ids, device=prefix_emb.device, dtype=torch.long
+        ).unsqueeze(0).repeat(prefix_emb.shape[0], 1)
         assistant_emb = self.llm.get_input_embeddings()(assistant_part)
 
         inputs_embeds = torch.cat([prefix_emb, img_emb, assistant_emb], dim=1)

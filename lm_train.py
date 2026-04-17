@@ -32,7 +32,7 @@ if __name__ == "__main__":
     model_id = "vlm_peft"
     model_name = "HuggingFaceTB/SmolLM-135M-Instruct"
 
-    train_loader, test_loader = get_dataloader(batch_size=256, tokenizer_name=model_name)
+    train_loader, test_loader = get_dataloader(batch_size=128, tokenizer_name=model_name)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     if tokenizer.pad_token is None:
@@ -46,8 +46,8 @@ if __name__ == "__main__":
     )
 
     # --- Optimizer Setup ---
-    lr_slow = 3e-4    # scaled from 1e-4 × √8 (batch_size 32 → 256)
-    lr_fast = 1.4e-3  # scaled from 5e-4 × √8
+    lr_slow = 2e-4    # scaled from 1e-4 × √(128/32)
+    lr_fast = 1e-3    # scaled from 5e-4 × √(128/32)
 
     qformer_params = model.qformer.get_grouped_params()
     optimizer = optim.AdamW(
@@ -64,7 +64,7 @@ if __name__ == "__main__":
     )
 
     # --- Training Configuration ---
-    epochs = 15
+    epochs = 5
     log_every = 20
     save_every = 100
     warmup_steps = 200  # fewer steps/epoch at batch_size=256
